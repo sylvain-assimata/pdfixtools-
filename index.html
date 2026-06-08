@@ -1685,13 +1685,9 @@ function handleFileSelect(e) {
 }
 
 /* ──────────────────────────────────────────
-   ILOVEPDF API — INTÉGRATION RÉELLE
-   Public Key : project_public_1aa5077d3c863b4862dec5a0b3fb4bdf_i75RL
-   Docs : https://developer.ilovepdf.com/docs/api-reference
+   ILOVEPDF API — VIA CLOUDFLARE WORKER PROXY
+   Worker : https://pdfixworker.kokou070a.workers.dev
 ────────────────────────────────────────── */
-const ILOVEPDF_PUBLIC_KEY  = 'project_public_1aa5077d3c863b4862dec5a0b3fb4bdf_i75RL';
-const ILOVEPDF_SECRET_KEY  = 'secret_key_1cd0fb4251f012ff15582ab410958ee4_23N8id8ba4e8d8852f7b201ae279af90cb89b';
-const ILOVEPDF_API = 'https://api.ilovepdf.com/v1';
 
 // Mapping outil PDFix → tâche ILovePDF
 const TOOL_TASK_MAP = {
@@ -1712,9 +1708,9 @@ const TOOL_TASK_MAP = {
   'extract':       'split',
   'reorder':       'rotatepdf',
   'repair':        'repair',
-  'annotate':      'compress',   // fallback
-  'redact':        'compress',   // fallback
-  'sign':          'compress',   // fallback
+  'annotate':      'compress',
+  'redact':        'compress',
+  'sign':          'compress',
 };
 
 // Options supplémentaires par outil
@@ -1729,10 +1725,11 @@ const TOOL_EXTRA_PARAMS = {
   'unlock':      () => ({ password: prompt('Entrez le mot de passe actuel du PDF :') || '' }),
 };
 
-// Fichier courant sélectionné
+// Fichier courant
 let currentFile = null;
-let currentTaskData = null; // { server, task }
 let currentDownloadUrl = null;
+
+const WORKER_URL = 'https://pdfixworker.kokou070a.workers.dev';
 
 function handleFileDrop(file) {
   currentFile = file;
@@ -1781,56 +1778,38 @@ function finishProgress(iv) {
   setTimeout(()=>{ wrap.classList.remove('show'); bar.style.width='0%'; }, 600);
 }
 
-/* ── Signature JWT avec Secret Key (HMAC-SHA256) ── */
-async function signJWT(payload) {
-  const header  = { alg: 'HS256', typ: 'JWT' };
-  const enc     = (obj) => btoa(JSON.stringify(obj)).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
-  const data    = enc(header) + '.' + enc(payload);
-  const keyData = new TextEncoder().encode(ILOVEPDF_SECRET_KEY);
-  const msgData = new TextEncoder().encode(data);
-  const cryptoKey = await crypto.subtle.importKey('raw', keyData, { name:'HMAC', hash:'SHA-256' }, false, ['sign']);
-  const sig     = await crypto.subtle.sign('HMAC', cryptoKey, msgData);
-  const b64     = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
-  return data + '.' + b64;
-}
-
-/* ── Étape 1 : Authentification avec JWT signé ── */
+/* ── Étape 1 : Auth via Worker ── */
 async function ilovepdfAuth() {
-  const payload = {
-    iss: ILOVEPDF_PUBLIC_KEY,
-    iat: Math.floor(Date.now()/1000),
-    exp: Math.floor(Date.now()/1000) + 3600,
-    nbf: Math.floor(Date.now()/1000),
-  };
-  const jwt = await signJWT(payload);
-
-  const res = await fetch(`${ILOVEPDF_API}/auth`, {
+  const res = await fetch(`${WORKER_URL}/auth`, {
     method: 'POST',
-    headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify({ public_key: ILOVEPDF_PUBLIC_KEY })
+    headers: { 'Content-Type': 'application/json' }
   });
-  if(!res.ok) throw new Error('Authentification ILovePDF échouée (vérifiez vos clés)');
+  if(!res.ok) throw new Error('Authentification échouée — vérifiez l\'URL du Worker');
   const data = await res.json();
+  if(data.error) throw new Error(data.error);
   return data.token;
 }
 
-/* ── Étape 2 : Démarrer une tâche → récupère server + task ── */
+/* ── Étape 2 : Démarrer une tâche via Worker ── */
 async function ilovepdfStart(token, task) {
-  const res = await fetch(`${ILOVEPDF_API}/start/${task}`, {
+  const res = await fetch(`${WORKER_URL}/start/${task}`, {
     headers: { 'Authorization': `Bearer ${token}` }
   });
   if(!res.ok) throw new Error('Démarrage tâche échoué');
-  return await res.json(); // { server, task }
+  return await res.json();
 }
 
-/* ── Étape 3 : Upload du fichier ── */
+/* ── Étape 3 : Upload via Worker ── */
 async function ilovepdfUpload(token, server, task, file) {
   const form = new FormData();
   form.append('task', task);
   form.append('file', file, file.name);
-  const res = await fetch(`https://${server}/v1/upload`, {
+  const res = await fetch(`${WORKER_URL}/upload`, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}` },
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'X-ILP-Server':  server
+    },
     body: form
   });
   if(!res.ok) throw new Error('Upload échoué');
@@ -1838,17 +1817,20 @@ async function ilovepdfUpload(token, server, task, file) {
   return data.server_filename;
 }
 
-/* ── Étape 4 : Traitement ── */
+/* ── Étape 4 : Traitement via Worker ── */
 async function ilovepdfProcess(token, server, task, serverFilename, filename, extraParams={}) {
   const body = {
-    task,
-    tool: task,
+    task, tool: task,
     files: [{ server_filename: serverFilename, filename }],
     ...extraParams
   };
-  const res = await fetch(`https://${server}/v1/process`, {
+  const res = await fetch(`${WORKER_URL}/process`, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type':'application/json' },
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type':  'application/json',
+      'X-ILP-Server':  server
+    },
     body: JSON.stringify(body)
   });
   if(!res.ok) {
@@ -1858,10 +1840,13 @@ async function ilovepdfProcess(token, server, task, serverFilename, filename, ex
   return await res.json();
 }
 
-/* ── Étape 5 : Téléchargement ── */
+/* ── Étape 5 : Téléchargement via Worker ── */
 async function ilovepdfDownload(token, server, task) {
-  const res = await fetch(`https://${server}/v1/download/${task}`, {
-    headers: { 'Authorization': `Bearer ${token}` }
+  const res = await fetch(`${WORKER_URL}/download/${task}`, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'X-ILP-Server':  server
+    }
   });
   if(!res.ok) throw new Error('Téléchargement échoué');
   const blob = await res.blob();
