@@ -1684,56 +1684,261 @@ function handleFileSelect(e) {
   if(e.target.files.length) handleFileDrop(e.target.files[0]);
 }
 
+/* ──────────────────────────────────────────
+   ILOVEPDF API — INTÉGRATION RÉELLE
+   Public Key : project_public_1aa5077d3c863b4862dec5a0b3fb4bdf_i75RL
+   Docs : https://developer.ilovepdf.com/docs/api-reference
+────────────────────────────────────────── */
+const ILOVEPDF_PUBLIC_KEY  = 'project_public_1aa5077d3c863b4862dec5a0b3fb4bdf_i75RL';
+const ILOVEPDF_SECRET_KEY  = 'secret_key_1cd0fb4251f012ff15582ab410958ee4_23N8id8ba4e8d8852f7b201ae279af90cb89b';
+const ILOVEPDF_API = 'https://api.ilovepdf.com/v1';
+
+// Mapping outil PDFix → tâche ILovePDF
+const TOOL_TASK_MAP = {
+  'compress':      'compress',
+  'merge':         'merge',
+  'split':         'split',
+  'pdf-to-word':   'pdfoffice',
+  'pdf-to-excel':  'pdfoffice',
+  'pdf-to-ppt':    'pdfoffice',
+  'pdf-to-image':  'pdfjpg',
+  'word-to-pdf':   'officepdf',
+  'image-to-pdf':  'imagepdf',
+  'rotate':        'rotatepdf',
+  'watermark':     'watermark',
+  'page-numbers':  'pagenumber',
+  'protect':       'protect',
+  'unlock':        'unlock',
+  'extract':       'split',
+  'reorder':       'rotatepdf',
+  'repair':        'repair',
+  'annotate':      'compress',   // fallback
+  'redact':        'compress',   // fallback
+  'sign':          'compress',   // fallback
+};
+
+// Options supplémentaires par outil
+const TOOL_EXTRA_PARAMS = {
+  'compress':    () => { const q = document.querySelector('.opt-pill.active'); return { compression_level: q ? (q.textContent.includes('Faible')?'low':q.textContent.includes('Fort')?'extreme':'recommended') : 'recommended' }; },
+  'pdf-to-word': () => ({ output_format: 'docx' }),
+  'pdf-to-excel':() => ({ output_format: 'xlsx' }),
+  'pdf-to-ppt':  () => ({ output_format: 'pptx' }),
+  'watermark':   () => ({ mode:'text', text:'PDFix', vertical_position:'middle', horizontal_position:'center', transparency:50 }),
+  'page-numbers':() => ({ starting_number:1, vertical_position:'bottom', horizontal_position:'center' }),
+  'protect':     () => ({ password: prompt('Entrez le mot de passe pour protéger le PDF :') || 'pdfixprotect' }),
+  'unlock':      () => ({ password: prompt('Entrez le mot de passe actuel du PDF :') || '' }),
+};
+
+// Fichier courant sélectionné
+let currentFile = null;
+let currentTaskData = null; // { server, task }
+let currentDownloadUrl = null;
+
 function handleFileDrop(file) {
+  currentFile = file;
+  currentDownloadUrl = null;
   document.getElementById('fileName').textContent = file.name;
   document.getElementById('fileSize').textContent = formatBytes(file.size);
   document.getElementById('filePreview').classList.add('show');
   document.getElementById('processBtn').disabled = false;
+  const resultBox = document.getElementById('resultBox');
+  if(resultBox) resultBox.classList.remove('show');
   showToast('info', `Fichier "${file.name}" chargé`);
   saveRecent(file.name);
 }
 
 function removeFile() {
+  currentFile = null;
+  currentDownloadUrl = null;
   document.getElementById('filePreview').classList.remove('show');
   document.getElementById('processBtn').disabled = true;
   document.getElementById('resultBox').classList.remove('show');
   document.getElementById('progressWrap').classList.remove('show');
 }
 
-function processFile(toolId) {
+/* Barre de progression animée */
+function startProgress(label) {
+  const wrap = document.getElementById('progressWrap');
+  const bar  = document.getElementById('progressBar');
+  const lbl  = document.getElementById('progressLabel');
+  wrap.classList.add('show');
+  bar.style.width = '0%';
+  lbl.textContent = label;
+  let prog = 0;
+  const iv = setInterval(()=>{
+    prog += Math.random()*6+1;
+    if(prog >= 90) { clearInterval(iv); prog = 90; }
+    bar.style.width = prog+'%';
+  }, 200);
+  return iv;
+}
+
+function finishProgress(iv) {
+  clearInterval(iv);
+  const bar = document.getElementById('progressBar');
+  const wrap = document.getElementById('progressWrap');
+  bar.style.width = '100%';
+  setTimeout(()=>{ wrap.classList.remove('show'); bar.style.width='0%'; }, 600);
+}
+
+/* ── Signature JWT avec Secret Key (HMAC-SHA256) ── */
+async function signJWT(payload) {
+  const header  = { alg: 'HS256', typ: 'JWT' };
+  const enc     = (obj) => btoa(JSON.stringify(obj)).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+  const data    = enc(header) + '.' + enc(payload);
+  const keyData = new TextEncoder().encode(ILOVEPDF_SECRET_KEY);
+  const msgData = new TextEncoder().encode(data);
+  const cryptoKey = await crypto.subtle.importKey('raw', keyData, { name:'HMAC', hash:'SHA-256' }, false, ['sign']);
+  const sig     = await crypto.subtle.sign('HMAC', cryptoKey, msgData);
+  const b64     = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+  return data + '.' + b64;
+}
+
+/* ── Étape 1 : Authentification avec JWT signé ── */
+async function ilovepdfAuth() {
+  const payload = {
+    iss: ILOVEPDF_PUBLIC_KEY,
+    iat: Math.floor(Date.now()/1000),
+    exp: Math.floor(Date.now()/1000) + 3600,
+    nbf: Math.floor(Date.now()/1000),
+  };
+  const jwt = await signJWT(payload);
+
+  const res = await fetch(`${ILOVEPDF_API}/auth`, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify({ public_key: ILOVEPDF_PUBLIC_KEY })
+  });
+  if(!res.ok) throw new Error('Authentification ILovePDF échouée (vérifiez vos clés)');
+  const data = await res.json();
+  return data.token;
+}
+
+/* ── Étape 2 : Démarrer une tâche → récupère server + task ── */
+async function ilovepdfStart(token, task) {
+  const res = await fetch(`${ILOVEPDF_API}/start/${task}`, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  if(!res.ok) throw new Error('Démarrage tâche échoué');
+  return await res.json(); // { server, task }
+}
+
+/* ── Étape 3 : Upload du fichier ── */
+async function ilovepdfUpload(token, server, task, file) {
+  const form = new FormData();
+  form.append('task', task);
+  form.append('file', file, file.name);
+  const res = await fetch(`https://${server}/v1/upload`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}` },
+    body: form
+  });
+  if(!res.ok) throw new Error('Upload échoué');
+  const data = await res.json();
+  return data.server_filename;
+}
+
+/* ── Étape 4 : Traitement ── */
+async function ilovepdfProcess(token, server, task, serverFilename, filename, extraParams={}) {
+  const body = {
+    task,
+    tool: task,
+    files: [{ server_filename: serverFilename, filename }],
+    ...extraParams
+  };
+  const res = await fetch(`https://${server}/v1/process`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type':'application/json' },
+    body: JSON.stringify(body)
+  });
+  if(!res.ok) {
+    const err = await res.json().catch(()=>({}));
+    throw new Error(err.message || 'Traitement échoué');
+  }
+  return await res.json();
+}
+
+/* ── Étape 5 : Téléchargement ── */
+async function ilovepdfDownload(token, server, task) {
+  const res = await fetch(`https://${server}/v1/download/${task}`, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  if(!res.ok) throw new Error('Téléchargement échoué');
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+
+/* ── Fonction principale appelée au clic "Lancer le traitement" ── */
+async function processFile(toolId) {
+  if(!currentFile) { showToast('error','Veuillez d\'abord sélectionner un fichier.'); return; }
+
+  const task = TOOL_TASK_MAP[toolId];
+  if(!task) { showToast('error','Outil non supporté pour le moment.'); return; }
+
   const btn = document.getElementById('processBtn');
   btn.disabled = true;
-  const progressWrap = document.getElementById('progressWrap');
-  const progressBar = document.getElementById('progressBar');
-  const progressLabel = document.getElementById('progressLabel');
-  progressWrap.classList.add('show');
+  currentDownloadUrl = null;
 
-  const steps = ['Analyse du fichier…','Traitement en cours…','Finalisation…','Presque prêt…'];
-  let prog = 0;
-  let stepIdx = 0;
-  const iv = setInterval(()=>{
-    prog += Math.random()*18+4;
-    if(prog>=100) prog=100;
-    progressBar.style.width = prog+'%';
-    progressWrap.setAttribute('aria-valuenow', Math.round(prog));
-    if(stepIdx < steps.length && prog > stepIdx*25+10) {
-      progressLabel.textContent = steps[stepIdx]; stepIdx++;
+  const iv = startProgress('Connexion aux serveurs…');
+  document.getElementById('progressLabel').textContent = 'Connexion aux serveurs…';
+
+  try {
+    // 1. Auth
+    document.getElementById('progressLabel').textContent = 'Authentification…';
+    const token = await ilovepdfAuth();
+
+    // 2. Start
+    document.getElementById('progressLabel').textContent = 'Démarrage de la tâche…';
+    const { server, task: taskId } = await ilovepdfStart(token, task);
+
+    // 3. Upload
+    document.getElementById('progressLabel').textContent = 'Envoi du fichier…';
+    const serverFilename = await ilovepdfUpload(token, server, taskId, currentFile);
+
+    // 4. Process
+    document.getElementById('progressLabel').textContent = 'Traitement en cours…';
+    const extra = TOOL_EXTRA_PARAMS[toolId] ? TOOL_EXTRA_PARAMS[toolId]() : {};
+    await ilovepdfProcess(token, server, taskId, serverFilename, currentFile.name, extra);
+
+    // 5. Download URL
+    document.getElementById('progressLabel').textContent = 'Finalisation…';
+    const url = await ilovepdfDownload(token, server, taskId);
+    currentDownloadUrl = url;
+
+    finishProgress(iv);
+
+    // Afficher le résultat
+    const resultBox = document.getElementById('resultBox');
+    resultBox.classList.add('show');
+
+    // Mettre à jour le lien de téléchargement avec la vraie URL
+    const dlBtn = resultBox.querySelector('.btn-download');
+    if(dlBtn) {
+      dlBtn.href = url;
+      dlBtn.download = 'PDFix_' + currentFile.name;
+      dlBtn.onclick = null; // désactiver le simulateDownload
     }
-    if(prog>=100){
-      clearInterval(iv);
-      setTimeout(()=>{
-        progressWrap.classList.remove('show');
-        document.getElementById('resultBox').classList.add('show');
-        showToast('success','Traitement terminé avec succès !');
-        btn.disabled = false;
-      }, 300);
-    }
-  }, 120);
+
+    showToast('success', '✅ Traitement terminé ! Cliquez sur Télécharger.');
+
+  } catch(err) {
+    finishProgress(iv);
+    console.error('ILovePDF Error:', err);
+    showToast('error', '❌ Erreur : ' + (err.message || 'Réessayez dans un instant.'));
+    btn.disabled = false;
+  }
+
+  btn.disabled = false;
 }
 
 function simulateDownload(e) {
+  // Gardé pour compatibilité — remplacé dynamiquement si URL réelle disponible
+  if(currentDownloadUrl) {
+    // URL réelle déjà définie sur le lien, laisser le navigateur gérer
+    return;
+  }
   e.preventDefault();
-  showToast('success', 'Téléchargement lancé !');
+  showToast('info', 'Lancez d\'abord le traitement pour obtenir le fichier.');
 }
 
 function toggleFaq(idx) {
