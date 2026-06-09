@@ -1821,7 +1821,7 @@ async function ilovepdfUpload(token, server, task, file) {
 /* ── Étape 4 : Traitement via Worker ── */
 async function ilovepdfProcess(token, server, task, serverFilename, filename, extraParams={}) {
   const body = {
-    task, tool: task,
+    task,
     files: [{ server_filename: serverFilename, filename }],
     ...extraParams
   };
@@ -1835,8 +1835,10 @@ async function ilovepdfProcess(token, server, task, serverFilename, filename, ex
     body: JSON.stringify(body)
   });
   if(!res.ok) {
-    const err = await res.json().catch(()=>({}));
-    throw new Error(err.message || 'Traitement échoué');
+    const errText = await res.text().catch(()=>'');
+    let errMsg = 'Traitement échoué';
+    try { errMsg = JSON.parse(errText).message || errMsg; } catch(e) {}
+    throw new Error(errMsg);
   }
   return await res.json();
 }
