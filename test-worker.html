@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Test Worker PDFix</title>
+  <style>
+    body{font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px;}
+    button{padding:12px 24px;background:#5B4DFF;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:1rem;margin:8px 4px;}
+    button:hover{opacity:.85;}
+    #log{background:#1a1a2e;color:#0f0;padding:20px;border-radius:8px;margin-top:20px;min-height:100px;font-family:monospace;font-size:.85rem;white-space:pre-wrap;overflow-y:auto;max-height:400px;}
+    .err{color:#ff4d8d;}
+    .ok{color:#00C2A8;}
+    input[type=file]{margin:10px 0;display:block;}
+  </style>
+</head>
+<body>
+  <h2>🔧 Test Worker PDFix</h2>
+  <p>Cet outil teste chaque étape de l'API ILovePDF via votre Worker Cloudflare.</p>
+
+  <button onclick="testAuth()">1️⃣ Tester /auth</button>
+  <button onclick="testPing()">🔍 Tester connexion Worker</button>
+
+  <hr/>
+  <p><strong>Test complet (compression) :</strong></p>
+  <input type="file" id="pdfFile" accept=".pdf"/>
+  <button onclick="testFull()">2️⃣ Tester compression complète</button>
+
+  <div id="log">En attente…</div>
+
+  <script>
+    const WORKER = 'https://pdfixworker.kokou070a.workers.dev';
+    const log = document.getElementById('log');
+
+    function write(msg, type='') {
+      const line = document.createElement('div');
+      line.className = type;
+      line.textContent = new Date().toLocaleTimeString() + ' — ' + msg;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function clear() { log.innerHTML = ''; }
+
+    async function testPing() {
+      clear();
+      write('Test connexion vers le Worker...');
+      try {
+        const res = await fetch(`${WORKER}/`, { method: 'GET' });
+        write(`Réponse HTTP : ${res.status}`, res.status < 500 ? 'ok' : 'err');
+        const text = await res.text();
+        write('Contenu : ' + text.slice(0,100));
+      } catch(e) {
+        write('ERREUR RÉSEAU : ' + e.message, 'err');
+        write('→ Vérifiez que le Worker est bien déployé sur Cloudflare', 'err');
+      }
+    }
+
+    async function testAuth() {
+      clear();
+      write('Test POST /auth...');
+      try {
+        const res = await fetch(`${WORKER}/auth`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        write(`Statut HTTP : ${res.status}`, res.status === 200 ? 'ok' : 'err');
+        const data = await res.json();
+        write('Réponse : ' + JSON.stringify(data).slice(0,200));
+        if(data.token) {
+          write('✅ TOKEN OBTENU ! Worker fonctionne correctement.', 'ok');
+          write('Token (début) : ' + data.token.slice(0,40) + '...', 'ok');
+        } else if(data.error) {
+          write('❌ Erreur ILovePDF : ' + data.error, 'err');
+        }
+      } catch(e) {
+        write('❌ ERREUR : ' + e.message, 'err');
+      }
+    }
+
+    async function testFull() {
+      const file = document.getElementById('pdfFile').files[0];
+      if(!file) { alert('Sélectionnez un fichier PDF d\'abord'); return; }
+      clear();
+      write('=== TEST COMPLET COMPRESSION ===');
+
+      try {
+        // 1. Auth
+        write('Étape 1 : Auth...');
+        const authRes = await fetch(`${WORKER}/auth`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        const authData = await authRes.json();
+        if(!authData.token) throw new Error('Auth échouée : ' + JSON.stringify(authData));
+        write('✅ Auth OK — token obtenu', 'ok');
+        const token = authData.token;
+
+        // 2. Start
+        write('Étape 2 : Start task...');
+        const startRes = await fetch(`${WORKER}/start/compress`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const startData = await startRes.json();
+        write('Start réponse : ' + JSON.stringify(startData));
+        if(!startData.server) throw new Error('Start échoué : ' + JSON.stringify(startData));
+        write('✅ Task démarrée — server: ' + startData.server, 'ok');
+        const { server, task } = startData;
+
+        // 3. Upload
+        write('Étape 3 : Upload fichier...');
+        const form = new FormData();
+        form.append('task', task);
+        form.append('file', file, file.name);
+        const uploadRes = await fetch(`${WORKER}/upload`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}`, 'X-ILP-Server': server },
+          body: form
+        });
+        const uploadData = await uploadRes.json();
+        write('Upload réponse : ' + JSON.stringify(uploadData));
+        if(!uploadData.server_filename) throw new Error('Upload échoué');
+        write('✅ Upload OK — ' + uploadData.server_filename, 'ok');
+
+        // 4. Process
+        write('Étape 4 : Traitement...');
+        const procRes = await fetch(`${WORKER}/process`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'X-ILP-Server': server
+          },
+          body: JSON.stringify({
+            task, tool: 'compress',
+            files: [{ server_filename: uploadData.server_filename, filename: file.name }],
+            compression_level: 'recommended'
+          })
+        });
+        const procData = await procRes.json();
+        write('Process réponse : ' + JSON.stringify(procData));
+        write('✅ Traitement OK', 'ok');
+
+        // 5. Download
+        write('Étape 5 : Téléchargement...');
+        const dlRes = await fetch(`${WORKER}/download/${task}`, {
+          headers: { 'Authorization': `Bearer ${token}`, 'X-ILP-Server': server }
+        });
+        write('Download statut : ' + dlRes.status);
+        if(!dlRes.ok) throw new Error('Download échoué : ' + dlRes.status);
+        const blob = await dlRes.blob();
+        write('✅ Fichier reçu ! Taille : ' + (blob.size/1024).toFixed(1) + ' KB', 'ok');
+
+        // Déclencher le téléchargement
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'compressed_' + file.name;
+        a.click();
+        write('🎉 TÉLÉCHARGEMENT LANCÉ !', 'ok');
+
+      } catch(e) {
+        write('❌ ERREUR : ' + e.message, 'err');
+        write('Stack : ' + e.stack, 'err');
+      }
+    }
+  </script>
+</body>
+</html>
